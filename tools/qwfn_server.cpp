@@ -993,9 +993,11 @@ int main(int argc, char ** argv) {
         }
         if (a == "--mtp" && i + 1 < argc) { cfg.mtp_path = next(); cfg.rollback_snapshots = true; continue; }   // the nextn draft head: pairs verified by the trunk, exact
         if (a == "--kv" && i + 1 < argc) {
-            std::string v = next();
-            cfg.type_k = cfg.type_v = (v == "q8_0") ? GGML_TYPE_Q8_0 :
-                                      (v == "q4_0") ? GGML_TYPE_Q4_0 : GGML_TYPE_F16;
+            std::string v = next(), kerr;
+            if (!parse_kv_spec(v, cfg.type_k, cfg.type_v, kerr)) {
+                fprintf(stderr, "--kv: %s\n", kerr.c_str());
+                return 1;
+            }
             continue;
         }
         fprintf(stderr, "unknown option: %s\n", a.c_str());

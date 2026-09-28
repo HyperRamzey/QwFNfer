@@ -36,6 +36,16 @@ struct state_config {
     bool      kv_host  = false;
 };
 
+// The K and V caches are separate tensors with separate types all the way down, and
+// the graph builds each view from its own tensor's type, so a split is a spelling
+// question rather than a new cache. "q8_0", "q4_0" and "f16" set both; "K/V" of those
+// sets them apart, e.g. "q8_0/q4_0" for a K that wants the extra bit and a V that
+// does not -- at 131K that is 1.71 GB against 1.71/0.91, and V is the larger share of
+// the gather. Whether the attention kernel actually runs two types at once is a
+// measured question, not an assumed one: see the note where it is used.
+bool parse_kv_spec(const std::string & spec, ggml_type & type_k, ggml_type & type_v,
+                   std::string & err);
+
 class state {
 public:
     ~state();
