@@ -187,30 +187,52 @@ bool expert_cache::init(const model_index * hot, const model_index * cold,
         want += 1ull << 20;
         // The dynamic part: the last layers' arrays, freed while a prefill
         // runs so its staging, batch buffers and arenas can have that memory.
-        // The back-off keeps at least that much: a tier is an optimisation,
-        // the prefill is not.
-        const size_t lend = cfg.lend_bytes;
-        if (lend && want < lend + (1ull << 20)) want = lend + (1ull << 20);
+        //
+        // THE LEND IS ELASTIC, AND IT YIELDS BEFORE THE TIER DOES. It used to be a
+        // constant and the back-off's floor was `lend + 1 MiB`, so the tier could not
+        // shrink below the very staging it was lending: on a 12 GB card, where the
+        // dense core and the context's state are already resident, a large --batch
+        // put the floor above everything the device had left and the engine printed
+        // "VRAM tier disabled: no device memory available" with all 24,576 experts
+        // computed on the CPU. A tier is an optimisation and the prefill is not (the
+        // comment two hundred lines up already says so), so the lend is cut toward a
+        // floor before a single expert slot is given up. The prefill's own device
+        // buffer is allocated per prefill, so a smaller lend is a smaller batch, not
+        // a broken one -- and the console picks --batch from what the tier can lend.
+        constexpr size_t LEND_FLOOR = 256ull << 20;
+        size_t lend = std::min<size_t>(cfg.lend_bytes, LEND_FLOOR * 8);
+        const auto tier_bytes = [&]() {
+            size_t t = 1ull << 20;
+            for (uint32_t il = 0; il < n_layer; il++) t += (size_t) gslots[il] * nat[il] + TIER_PAD;
+            return t;
+        };
+        // The tier is at least the lend, because the lend is carved out of it.
+        const auto want_bytes = [&]() {
+            return std::max(tier_bytes(), lend ? lend + (1ull << 20) : (size_t) 0);
+        };
+        want = want_bytes();
         // Back off rather than fail: the tier is an optimisation, and asking
         // for more than the device has left should cost throughput, not the run.
         // Step down in 4% increments, not quarters: coarse steps threw away up
         // to a quarter of the device memory that was actually free, and 8% steps
         // still turned a 0.4 GB draft head into a 0.73 GB loss of tier; every
         // 2.18 MB block that fits is an expert that computes 3.2x faster.
-        // Probe once with the reservation included, then release it, so the
-        // back-off converges on a size that still leaves room for the graphs.
-        if (ggml_backend_buffer_t probe = ggml_backend_buft_alloc_buffer(cfg.vram_buft, cfg.vram_reserve)) {
-            ggml_backend_buffer_free(probe);
-        }
         ggml_backend_buffer_t fit = nullptr;
-        while (want > std::max<size_t>(256ull << 20, lend + (1ull << 20)) &&
-               !(fit = ggml_backend_buft_alloc_buffer(cfg.vram_buft, want + cfg.vram_reserve))) {
-            want = 1ull << 20;
-            for (uint32_t il = 0; il < n_layer; il++) {
-                gslots[il] = (uint32_t) std::max<size_t>(1, (size_t) (gslots[il] * 0.96));
-                want += (size_t) gslots[il] * nat[il] + TIER_PAD;
+        while (!(fit = ggml_backend_buft_alloc_buffer(cfg.vram_buft, want + cfg.vram_reserve))) {
+            if (lend > LEND_FLOOR) {          // 1. the staging gives way first
+                lend = std::max(LEND_FLOOR, lend / 2);
+                want = want_bytes();
+                continue;
             }
-            if (lend && want < lend + (1ull << 20)) want = lend + (1ull << 20);
+            if (want <= (256ull << 20)) break;   // 2. then the tier, down to a floor
+            bool shrank = false;
+            for (uint32_t il = 0; il < n_layer; il++) {
+                const uint32_t ns = (uint32_t) std::max<size_t>(1, (size_t) (gslots[il] * 0.96));
+                shrank = shrank || ns != gslots[il];
+                gslots[il] = ns;
+            }
+            want = want_bytes();
+            if (!shrank) break;               // every layer is already at one slot
         }
         if (fit) ggml_backend_buffer_free(fit);
         if (!fit) {
