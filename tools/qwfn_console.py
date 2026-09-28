@@ -987,8 +987,18 @@ def recommend(
     # 4096 tokens on top of the staging -- and the tier must keep more than that or it is
     # disabled, so the batch is picked per context below: the largest whose lend leaves
     # the tier at least a gigabyte. Decode is unchanged either way (harness, same session).
-    BATCH_LEND_GB = {2048: 3.9, 4096: 4.4, 8192: 4.98, 16384: 6.16}
+    #
+    # 512 and 1024 are here for the small cards. The lend is mostly a fixed staging
+    # cost plus a little per token, so a small batch is not a small saving: measured on
+    # an RTX 5070 (12,227 MiB) with the IQ4_XS uncensored checkpoint, the engine reported
+    # 2.57 GB lent at --batch 512 against 3.71 GB at --batch 2048, and at 2048 the whole
+    # tier ended up dynamic (nothing permanent) on a 3.45 GB tier. Their rows below are
+    # extrapolated along the reference machine's own trend rather than measured there;
+    # the shape is what matters, and the engine is the authority either way.
+    BATCH_LEND_GB = {512: 3.4, 1024: 3.65, 2048: 3.9, 4096: 4.4, 8192: 4.98, 16384: 6.16}
     PREFILL_TPS = {
+        512: 120,
+        1024: 170,
         2048: 240,
         4096: 300,
         8192: 479,
@@ -1000,10 +1010,10 @@ def recommend(
         return BATCH_LEND_GB[b] - q3_adj
 
     def batch_for(tier_gb):
-        for b in (16384, 8192, 4096, 2048):
+        for b in (16384, 8192, 4096, 2048, 1024, 512):
             if tier_gb - lend_for(b) >= 1.0:
                 return b
-        return 2048
+        return 512
 
     forced_state = (
         state_host if state_host in STATE_HOST_OPTIONS else None
@@ -1276,6 +1286,14 @@ def recommend(
             o["ram"] = int(custom.get("ram") or o["ram"])
             o["threads"] = int(custom.get("threads") or o["threads"])
             o["batch"] = int(custom.get("batch") or o["batch"])
+            # A saved batch is the user's, so price it as itself: o["prefill_tps"]
+            # came from the ladder's choice, which is a different batch whenever the
+            # saved one differs. Unknown sizes keep the ladder's number rather than
+            # raising -- a Custom tier is allowed to hold anything the user typed.
+            o["prefill_tps"] = int(
+                PREFILL_TPS.get(o["batch"], PREFILL_TPS[2048])
+                * min(1.0, nvme / NVME_MB_PER_MS)
+            )
             short = predict(
                 q, o["tier_gb"], o["ram"], False, state_host_ms(ck, csh), nvme
             )
