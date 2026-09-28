@@ -52,9 +52,8 @@ int main(int argc, char ** argv) {
             cfg.kv_host  = v.find("kv")  != std::string::npos;
             continue;
         }
-        if (a == "--kv" && i + 1 < argc) { std::string v = next();
-            cfg.type_k = cfg.type_v = (v == "q8_0") ? GGML_TYPE_Q8_0 :
-                                      (v == "q4_0") ? GGML_TYPE_Q4_0 : GGML_TYPE_F16; continue; }
+        if (a == "--kv" && i + 1 < argc) { std::string v = next(), kerr;
+            if (!parse_kv_spec(v, cfg.type_k, cfg.type_v, kerr)) { fprintf(stderr, "--kv: %s\n", kerr.c_str()); return 1; } continue; }
         if (a == "--no-reuse") { cfg.reuse_graphs = false; continue; }
         if (a == "--no-speculate") { cfg.speculate = false; continue; }
         if (a == "--skip-miss") { cfg.skip_miss = true; continue; }

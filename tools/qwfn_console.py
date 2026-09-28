@@ -840,14 +840,63 @@ LOOKUPS_PER_TOKEN = 480  # 48 layers x 10 routed experts
 # decode per GB at 131K and is what gives the 256K preset an expert tier at all
 # (7.0 -> 9.7 tok/s measured, 2026-09-09).
 STATE_HOST_OPTIONS = ["none", "idx", "kv,idx"]
-KV_TYPES = ["q4_0", "q8_0", "f16"]
-KV_MB_PER_K = {"q4_0": 6.9, "q8_0": 13.1, "f16": 26.2}  # KV MB per 1K tokens
+# KV MB per 1K tokens, K and V together over the 12 attention layers. The K-quants
+# and q8_0 are the numbers that were here; the two-byte types are corrected against
+# the engine's own report (50,331,600 B at a 2048 context = 24.6 MB per 1K, against
+# 26.2 here before) because a KV that is 6% larger than the plan believes is a KV
+# that does not fit when the plan said it would.
+KV_MB_PER_K = {
+    "q4_0": 6.9,
+    "q4_1": 7.7,
+    "q5_0": 8.4,
+    "q5_1": 9.2,
+    "q8_0": 13.1,
+    "f16": 24.6,
+    "bf16": 24.6,
+}
+# Offered as two lists because the console now picks K and V apart; "q8_0/q4_0" is
+# what the two together mean to the engine, and the arithmetic is the mean of the
+# two sides since K and V are the same width. The per-type figures are what
+# qwfn-gen reports for a real load at 8192 ctx, rounded the same way as the ones
+# that were here before (q4_0 6.912, q8_0 13.056, f16 24.576), so a plan's state
+# figure lands on the allocation the engine actually makes. q4_1 and q5_1 cost
+# more than their q4_0/q5_0 namesakes: they carry a per-block min value.
+KV_TYPES = ["q4_0", "q4_1", "q5_0", "q5_1", "q8_0", "f16", "bf16"]
+
+
+def kv_mb_per_k(kv_k, kv_v=None):
+    """KV MB per 1K tokens for a K type and a V type, given separately or as one spec.
+
+    A split is exactly the mean of the two single-type costs -- (13.1 + 6.9) / 2 =
+    10.0 for q8_0/q4_0 -- and the engine's own report agrees: 20,447,200 B at a 2048
+    context against 26,738,700 for q8_0 and 14,155,800 for q4_0.
+    """
+    if kv_v is None:
+        kv_v = kv_k
+    if "/" in kv_k:
+        kv_k, kv_v = kv_k.split("/", 1)
+    return (KV_MB_PER_K[kv_k] + KV_MB_PER_K[kv_v]) / 2.0
+
+
+def kv_spec(kv_k, kv_v):
+    """What --kv takes: one name when both sides agree, "K/V" when they do not."""
+    return kv_k if kv_k == kv_v else "%s/%s" % (kv_k, kv_v)
+
+
+def kv_spec_ok(s):
+    """True for one KV type name, or a "K/V" pair of them. Input side, so it also has
+    to accept a split -- the page sends the spec it built from the two dropdowns, and
+    a tier saved before the split carries a single name."""
+    if not isinstance(s, str) or not s:
+        return False
+    parts = s.split("/")
+    return len(parts) <= 2 and all(p in KV_MB_PER_K for p in parts)
 
 
 def state_parts(ctx, kv):
     k = ctx / 1024 / 1024
     return {
-        "kv": KV_MB_PER_K[kv] * k,
+        "kv": kv_mb_per_k(kv) * k,
         "idx": 3.1 * k,
         "pooled": 0.8 * k,
         "delta": 0.113,
@@ -871,7 +920,7 @@ def state_vram_gb(ctx, kv, state_host):
 
 def state_host_ms(kv, state_host):
     return (0.35 if "idx" in state_host else 0.0) + (
-        1.7 * KV_MB_PER_K[kv] / KV_MB_PER_K["q4_0"] if "kv" in state_host else 0.0
+        1.7 * kv_mb_per_k(kv) / KV_MB_PER_K["q4_0"] if "kv" in state_host else 0.0
     )
 
 
@@ -1019,7 +1068,7 @@ def recommend(
         state_host if state_host in STATE_HOST_OPTIONS else None
     )  # None: chosen per context below
     forced_kv = (
-        kv if kv in KV_TYPES else None
+        kv if kv_spec_ok(kv) else None
     )  # None: the highest precision the GPU has room for
     # What the engine does with the VRAM left after the dense core and the context's state:
     # it takes OVERHEAD_GB for its CUDA context, decode state and graph arenas (measured
@@ -1136,6 +1185,10 @@ def recommend(
         return {
             "ctx": c,
             "kv": kv,
+            # The two sides separately, so the page can offer one control each; "kv"
+            # stays the spec the engine is started with.
+            "kv_k": kv.split("/")[0],
+            "kv_v": kv.split("/")[-1],
             "tier_gb": round(tier, 2),
             "blocks": short["blocks"],
             "state_gb": round(state_gb(c, kv), 2),
@@ -1271,7 +1324,10 @@ def recommend(
     custom = CONFIG["custom"].get(model["name"])
     if custom:
         try:
-            ck = custom.get("kv") if custom.get("kv") in KV_TYPES else "q4_0"
+            ck = custom.get("kv") if kv_spec_ok(custom.get("kv")) else None
+            ck_k = custom.get("kv_k") if custom.get("kv_k") in KV_TYPES else (ck or "q4_0")
+            ck_v = custom.get("kv_v") if custom.get("kv_v") in KV_TYPES else ck_k
+            ck = kv_spec(ck_k, ck_v)
             csh = (
                 custom.get("state_host")
                 if custom.get("state_host") in STATE_HOST_OPTIONS
@@ -1343,7 +1399,12 @@ def recommend(
     mm_gb = model.get("mmproj_gb", 0.0) if vision else 0.0
     chosen = option(p["ctx_actual"], vision) if preset != "custom" else None
     if preset == "custom":
-        ck = custom.get("kv") if custom.get("kv") in KV_TYPES else "q4_0"
+        # A tier saved before K and V could be named apart carries one "kv"; read it
+        # as both sides rather than dropping the setting.
+        ck = custom.get("kv") if kv_spec_ok(custom.get("kv")) else None
+        ck_k = custom.get("kv_k") if custom.get("kv_k") in KV_TYPES else (ck or "q4_0")
+        ck_v = custom.get("kv_v") if custom.get("kv_v") in KV_TYPES else ck_k
+        ck = kv_spec(ck_k, ck_v)
         csh = (
             custom.get("state_host")
             if custom.get("state_host") in STATE_HOST_OPTIONS
@@ -1360,6 +1421,8 @@ def recommend(
     out = {
         "ctx": chosen["ctx"],
         "kv": chosen["kv"],
+        "kv_k": chosen["kv"].split("/")[0],
+        "kv_v": chosen["kv"].split("/")[-1],
         "ram": chosen["ram"],
         "threads": chosen["threads"],
         "batch": chosen["batch"],
@@ -2244,11 +2307,18 @@ def run_tune(model, preset, settings_in):
         plan = recommend(model, hw, preset, None, None, None, calib)
         if preset == "custom" and settings_in:
             plan = {**plan, **{k: v for k, v in settings_in.items() if k in plan}}
+            # The page posts the two sides and the spec it built from them; if a stale
+            # run left the trio disagreeing, the sides win and the spec follows, so the
+            # tune starts the engine on exactly what the dropdowns say.
+            if plan.get("kv_k") in KV_TYPES and plan.get("kv_v") in KV_TYPES:
+                plan["kv"] = kv_spec(plan["kv_k"], plan["kv_v"])
         result["plan"] = {
             k: plan[k]
             for k in (
                 "ctx",
                 "kv",
+                "kv_k",
+                "kv_v",
                 "ram",
                 "threads",
                 "batch",
@@ -2724,6 +2794,8 @@ class H(http.server.BaseHTTPRequestHandler):
                 for k in (
                     "ctx",
                     "kv",
+                    "kv_k",
+                    "kv_v",
                     "ram",
                     "threads",
                     "batch",

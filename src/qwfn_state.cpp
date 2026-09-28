@@ -8,6 +8,40 @@
 
 namespace qwfn {
 
+static bool kv_type(const std::string & s, ggml_type & t) {
+    if (s == "q4_0") { t = GGML_TYPE_Q4_0; return true; }
+    if (s == "q4_1") { t = GGML_TYPE_Q4_1; return true; }
+    if (s == "q5_0") { t = GGML_TYPE_Q5_0; return true; }
+    if (s == "q5_1") { t = GGML_TYPE_Q5_1; return true; }
+    if (s == "q8_0") { t = GGML_TYPE_Q8_0; return true; }
+    if (s == "f16")   { t = GGML_TYPE_F16;   return true; }
+    // The checkpoint is bf16, so a bf16 cache is the lossless one and the baseline to
+    // measure the quantised K/V against rather than f16.
+    if (s == "bf16")  { t = GGML_TYPE_BF16;  return true; }
+    return false;
+}
+
+bool parse_kv_spec(const std::string & spec, ggml_type & type_k, ggml_type & type_v,
+                   std::string & err) {
+    ggml_type k, v;
+    const size_t slash = spec.find('/');
+    if (slash == std::string::npos) {
+        if (!kv_type(spec, k)) {
+            err = "unknown KV type '" + spec + "' (q4_0, q4_1, q5_0, q5_1, q8_0, f16, bf16, or K/V of those)";
+            return false;
+        }
+        type_k = type_v = k;
+        return true;
+    }
+    if (!kv_type(spec.substr(0, slash), k) || !kv_type(spec.substr(slash + 1), v)) {
+        err = "unknown KV pair '" + spec + "' (K/V, each of q4_0, q4_1, q5_0, q5_1, q8_0, f16, bf16)";
+        return false;
+    }
+    type_k = k;
+    type_v = v;
+    return true;
+}
+
 state::~state() {
     if (buf_)   ggml_backend_buffer_free(buf_);
     if (ctx_)   ggml_free(ctx_);
