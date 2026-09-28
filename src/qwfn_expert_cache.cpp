@@ -501,6 +501,17 @@ expert_cache::census expert_cache::ram_census() const {
 
 bool expert_cache::would_promote(layer_pool & lp, uint32_t expert_id) {
     if (!vram_buf_ || lp.g_slots == 0 || lp.g_lent) return false;
+    // A layer's tier can only hold g_slots experts, so once that many blocks have
+    // earned full precision, another one cannot. Without this the marker -- which
+    // is sticky, a block read hot staying hot -- runs away: measured 1208 marked
+    // against 1872 slots on a 5 GB tier, every miss taking the hot path, and the
+    // cold checkpoint never read once ("0 cold-file reads"). Reading the hottest
+    // tail at full precision from a second file is the whole point of the cold
+    // tier, and it cannot happen while every block claims the hot path.
+    if (lp.hotw_n >= lp.g_slots) return false;
+    // ... and one sighting is not a candidate. The cold tier exists for the
+    // one-off tail; a block fetched twice is the evidence the policy wants.
+    if (lp.ef[expert_id] < 2) return false;
     static const bool vram_lru = getenv("QWFN_VRAM_LRU") != nullptr;
     constexpr uint64_t STALE_FETCHES = 48 * 24;
     static thread_local uint64_t rng = 0x2545F4914F6CDD1Dull;
@@ -685,7 +696,7 @@ bool expert_cache::fetch_begin(uint32_t layer, const uint32_t * expert_ids, uint
         {
             const int32_t cs = lp.expert_slot[e];
             if (cs >= 0 && lp.slot_expert[cs] == (uint16_t) e && !lp.slot_valid[cs]) {
-                if (lp.slot_cold[cs] && !lp.hotw[e] && would_promote(lp, e)) lp.hotw[e] = 1;
+                if (lp.slot_cold[cs] && !lp.hotw[e] && would_promote(lp, e)) { lp.hotw[e] = 1; lp.hotw_n++; }
                 st_.hits++;
                 lp.slot_freq[cs]++;
                 lp.slot_used[cs] = ++tick_;
@@ -710,6 +721,7 @@ bool expert_cache::fetch_begin(uint32_t layer, const uint32_t * expert_ids, uint
         // reused cold block, when nothing was read hot yet, doubled the fill:
         // 12 -> 6 tok/s.)
         const bool upgrade = s >= 0 && lp.slot_cold[s] && would_promote(lp, e);
+        if (upgrade && !lp.hotw[e]) { lp.hotw[e] = 1; lp.hotw_n++; }
         if (upgrade) lp.hotw[e] = 1;
 
         if (s >= 0 && !upgrade) {
@@ -755,7 +767,7 @@ bool expert_cache::fetch_begin(uint32_t layer, const uint32_t * expert_ids, uint
         // the rule the prefetch applies. Without this a miss during the fill came
         // in cold, was reused while the tier still had empty slots (no re-read
         // then) and sat in RAM unpromotable for the rest of the run.
-        if (cold_ && !upgrade && !lp.hotw[e] && would_promote(lp, e)) lp.hotw[e] = 1;
+        if (cold_ && !upgrade && !lp.hotw[e] && would_promote(lp, e)) { lp.hotw[e] = 1; lp.hotw_n++; }
         const bool take_cold = cold_ != nullptr && !upgrade && !lp.hotw[e];
         lp.seen[e] = 1;
         const model_index * src = take_cold ? cold_ : hot_;
@@ -1346,7 +1358,7 @@ void expert_cache::prefetch_begin(const pf_set * sets, uint32_t n_sets) {
             pf_entry & ent = pf_pending_.back();
 
             uint8_t * base = slot_ptr(lp, (uint32_t) v);
-            if (cold_ && !lp.hotw[e] && would_promote(lp, e)) lp.hotw[e] = 1;   // a VRAM candidate is read at full precision
+            if (cold_ && !lp.hotw[e] && would_promote(lp, e)) { lp.hotw[e] = 1; lp.hotw_n++; }   // a VRAM candidate is read at full precision
             const bool pf_cold = cold_ != nullptr && !lp.hotw[e];   // the tail comes from the cold file
             lp.slot_cold[v] = pf_cold ? 1 : 0;
             if (pf_cold) st_.cold_tier_reads++;

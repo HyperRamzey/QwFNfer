@@ -322,6 +322,13 @@ private:
         // so the cold tier stays confined to the one-off tail it was meant for.
         std::vector<uint8_t>  seen;
         std::vector<uint8_t>  hotw;           // earned full precision at least once (a VRAM promotion candidate)
+        // How many of those there are, kept as it changes. The marker is sticky
+        // (a block read hot stays hot), so without a bound a layer collects
+        // candidates far past what its VRAM slots can hold: measured 1208 marked
+        // against 1872 slots, after which every miss took the hot path and the
+        // cold checkpoint was never read at all. would_promote() compares against
+        // this instead of counting the vector, which is 512 bytes per call.
+        uint32_t              hotw_n = 0;
 
         // T0: device memory, but NOT the same layout. Three expert-major
         // arrays (gate, up, down) with the natural slice size as the slot
