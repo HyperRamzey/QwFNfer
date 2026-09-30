@@ -98,17 +98,18 @@ public:
     // driven by tools/qwfn_iobpio.cpp) it did not reproduce.
     //
     // MEASURED 2026-09-30, HP FX900 Pro 2TB, 16 GB file, random 640 KiB-1 MiB
-    // slices, QD 1-64, modes interleaved, every mode byte-exact:
+    // slices, QD 1-64, modes interleaved, every mode byte-exact, and the whole
+    // sweep repeated in an elevated process:
     //
-    //   ioring/direct+wait   1.62 GB/s at QD 8 (+1.2%), 1.60 at QD 32 (-0.5%)
-    //                        thread pool 1.60 / 1.61 on the same pattern
-    //   service latency, QD 1, 2000 samples: ring p50 539 us, mean 541;
-    //                                    pool p50 557 us, mean 559
+    //   ioring/direct+wait   1.78-1.87 GB/s across QD 1-64 (+0.0% to +2.4%),
+    //                        thread pool 1.73-1.86 on the same pattern
+    //   service latency, QD 1, 2000 samples: ring p50 515 us, p95 583, mean 472;
+    //                                    pool p50 530 us, p95 595, mean 485
     //
     // So a ring is not slower than this pool -- it is the same to within about
-    // a percent, and marginally lower latency. There is no speed argument either
-    // way. What there is instead is a shape argument, and it is the one that
-    // decided it:
+    // two percent, and marginally lower latency at every percentile. There is no
+    // speed argument either way. What there is instead is a shape argument, and
+    // it is the one that decided it:
     //
     // The engine prefetches the next layer's experts *while the current layer
     // computes*, then reaps whatever has finished (reap(min_complete)). A
@@ -141,22 +142,32 @@ public:
     // file opened for cached or memory-mapped I/O suspends it until that handle
     // closes -- which this engine does, for the PLE table, on the same shards.
     //
-    // MEASURED 2026-09-30 with tools/qwfn_iobpio.cpp, two NVMe volumes
-    // (HP FX900 Pro 2TB, Intel SSDPEKNU512GZ), 16 GB and 12 GB files, 640 KiB
-    // - 1 MiB random slices, QD 1-64, modes interleaved over 4 rounds, every
-    // mode byte-exact: the kernel accepted it on every handle ("enabled on 1
-    // handle(s)") and throughput moved by -0.2% to -1.1% (C:) and -0.9% to
-    // -2.9% (D:) -- noise, never positive. Holding a read-only mapping of the
-    // same file open, as the engine does for the PLE table, moved it by -0.3%
-    // to +0.5%, which is what suspension predicts: it puts the read back on the
-    // path it already had.
+// MEASURED 2026-09-30 with tools/qwfn_iobpio.cpp, two NVMe volumes
+    // (HP FX900 Pro 2TB and Intel SSDPEKNU512GZ), 16 GB and 12 GB files,
+    // 640 KiB-1 MiB random slices, QD 1-64, modes interleaved, and a full second
+    // sweep run elevated. The kernel accepted it on every handle ("enabled on
+    // 1 handle(s)"), so this is not the mechanism being unavailable, and
+    // throughput moved by -1.6% to +0.2% (C:, the wider of the two sweeps) and
+    // -0.9% to -2.9% (D:). Noise, never positive.
     //
-    // The reason is visible in the same table and is the point: direct reads
-    // plateau at 1.6 GB/s (C:) and 1.17 GB/s (D:) by QD 8 and do not move at
-    // QD 16, 32 or 64. The device is the limit from QD 8, so there is no
-    // per-operation overhead left to remove -- which is also why IoRing could
-    // not have won here. Kept because it is cheap, and because the evidence for
-    // not bothering is worth more than the flag.
+    // Holding a read-only mapping of the same file open, as the engine does for
+    // the PLE table, changed nothing either: -0.3% to -1.7%, which is what
+    // suspension predicts, since it puts the read back on the path `direct` was
+    // already on.
+    //
+    // The reason is visible in the same sweep and is the point: direct reads
+    // plateau at 1.82-1.86 GB/s by QD 8 and do not move at 16, 32, 48 or 64.
+    // The device is the limit from QD 8, so there is no per-operation overhead
+    // left to remove -- which is also why IoRing could not have won here. Kept
+    // because it is cheap, and because the evidence for not bothering is worth
+    // more than the flag.
+    //
+    // One thing this cannot do on this box: make the buffered rows mean
+    // anything. The tool asks for MemoryPurgeStandbyList before measuring, and
+    // that call is refused even from an elevated process here, so every
+    // *buffered* number below and in the tool's output is cache-warm RAM. The
+    // unbuffered rows are immune -- they bypass the cache manager -- which is
+    // why the comparison above stands without it.
     bool init(const std::vector<std::string> & paths, unsigned queue_depth,
               bool direct_io, std::string & err, backend be = backend::uring,
               bool bypass_io = false);
