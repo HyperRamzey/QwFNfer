@@ -19,9 +19,11 @@
 
 #include <cerrno>
 #include <chrono>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 #include <algorithm>
 
 namespace qwfn {
@@ -104,8 +106,120 @@ io_engine::~io_engine() { shutdown(); }
 // ReadFile + OVERLAPPED still positions the read but serializes callers, so
 // the file is opened overlapped to keep the workers actually parallel.
 
+// --- BypassIO (Windows 11) -------------------------------------------------
+// FSCTL_MANAGE_BYPASS_IO. Declared in ntifs.h, which does not ship in a
+// user-mode SDK, so the control code and the three structures it takes are
+// spelled out here from the WDK definitions:
+//   CTL_CODE(0x0009, 0x112, METHOD_BUFFERED, FILE_ANY_ACCESS) == 0x00090448
+// The access field is FILE_ANY_ACCESS, so a plain DeviceIoControl on a file
+// handle we already own is enough -- no elevation, which is why this is worth
+// trying at all. Every field below is at its natural alignment, so no packing
+// pragmas are needed; the static_asserts are the check on that.
+#define FSCTL_MANAGE_BYPASS_IO_ 0x00090448u
+
+enum { FS_BPIO_OP_ENABLE = 1, FS_BPIO_OP_QUERY = 3, FS_BPIO_OP_DISABLE = 2 };
+
+struct fs_bpio_input {
+    DWORD     Operation;
+    DWORD     InFlags;
+    ULONGLONG Reserved1;
+    ULONGLONG Reserved2;
+};
+
+struct fs_bpio_results {
+    LONG    OpStatus;
+    USHORT  FailingDriverNameLen;
+    WCHAR   FailingDriverName[32];
+    USHORT  FailureReasonLen;
+    WCHAR   FailureReason[128];
+};
+
+struct fs_bpio_output {
+    DWORD            Operation;
+    DWORD            OutFlags;
+    ULONGLONG        Reserved1;
+    ULONGLONG        Reserved2;
+    fs_bpio_results  Results;   // Enable / Query / VolumeStackResume / StreamResume
+};
+
+static_assert(sizeof(fs_bpio_input)  == 24, "FS_BPIO_INPUT layout");
+static_assert(sizeof(fs_bpio_results) == 328, "FS_BPIO_RESULTS layout");
+static_assert(offsetof(fs_bpio_output, Results) == 24, "FS_BPIO_OUTPUT union offset");
+
+// The two WCHAR arrays are documented as "not guaranteed NUL-terminated", and
+// their lengths are in characters, so bound every conversion.
+static std::string wide_field(const WCHAR * w, USHORT nchars) {
+    if (nchars == 0) return "";
+    if (nchars > 128) nchars = 128;
+    std::string out;
+    out.reserve(nchars);
+    for (USHORT i = 0; i < nchars; i++) {
+        const wchar_t c = w[i];
+        if (c > 0x7f) { out += '?'; continue; }   // the reasons are English ASCII
+        out.push_back((char) c);
+    }
+    return out;
+}
+
+// One FSCTL round trip. `why` is filled with the vetoing driver and its reason
+// when the call fails, which is the whole diagnostic value of the interface.
+static bool bpio_call(HANDLE h, DWORD op, std::string & why) {
+    fs_bpio_input  in{};
+    in.Operation = op;
+    in.InFlags   = 0;                       // FS_BPIO_IN_FLAG_NONE
+    // FS_BPIO_OUTPUT also carries an FS_BPIO_INFO arm in its union; size the
+    // caller's buffer past either so a GET_INFO on a future build cannot
+    // overrun it.
+    std::vector<uint8_t> outbuf(1024, 0);
+    DWORD got = 0;
+    if (!DeviceIoControl(h, FSCTL_MANAGE_BYPASS_IO_, &in, sizeof(in),
+                         outbuf.data(), (DWORD) outbuf.size(), &got, nullptr)) {
+        char m[128] = {0};
+        FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+                       nullptr, GetLastError(), 0, m, sizeof(m), nullptr);
+        why = std::string("DeviceIoControl failed: ") + m;
+        return false;
+    }
+    if (got < offsetof(fs_bpio_output, Results) + sizeof(fs_bpio_results)) {
+        why = "short output (" + std::to_string(got) + " bytes)";
+        return false;
+    }
+    const auto * out = reinterpret_cast<const fs_bpio_output *>(outbuf.data());
+    if (out->Results.OpStatus < 0) {        // NTSTATUS: negative is failure
+        char st[16];
+        snprintf(st, sizeof(st), "0x%08lX", (unsigned long) out->Results.OpStatus);
+        why = std::string("NTSTATUS ") + st;
+        const std::string drv = wide_field(out->Results.FailingDriverName,
+                                           out->Results.FailingDriverNameLen);
+        const std::string rsn = wide_field(out->Results.FailureReason,
+                                           out->Results.FailureReasonLen);
+        if (!drv.empty()) why += " by " + drv;
+        if (!rsn.empty()) why += ": " + rsn;
+        return false;
+    }
+    return true;
+}
+
+// Try to put every handle on the BypassIO path. Requires direct I/O (BypassIO
+// is documented for noncached reads only) and at least one handle.
+static void enable_bypass_io(std::vector<int> & fds, std::string & note) {
+    if (fds.empty()) { note = "no handle"; return; }
+    std::string q;
+    if (!bpio_call((HANDLE) (intptr_t) fds[0], FS_BPIO_OP_QUERY, q)) {
+        note = "query: " + q;
+        return;
+    }
+    std::string e;
+    for (size_t i = 0; i < fds.size(); i++) {
+        if (bpio_call((HANDLE) (intptr_t) fds[i], FS_BPIO_OP_ENABLE, e)) continue;
+        note = "enable on shard " + std::to_string(i) + ": " + e;
+        return;
+    }
+    note = "enabled on " + std::to_string(fds.size()) + " handle(s)";
+}
+
 bool io_engine::init(const std::vector<std::string> & paths, unsigned queue_depth,
-                     bool direct_io, std::string & err, backend be) {
+                     bool direct_io, std::string & err, backend be, bool bypass_io) {
     // io_uring does not exist on Windows; every backend enum value resolves to
     // the thread pool, which is also the engine's default on Linux.
     (void) be;
@@ -113,6 +227,9 @@ bool io_engine::init(const std::vector<std::string> & paths, unsigned queue_dept
     direct_ = direct_io;
     be_     = backend::threads;
     qd_     = queue_depth ? queue_depth : 256;
+    bypass_req_ = bypass_io && direct_io;
+    bypass_on_  = false;
+    bypass_note_.clear();
 
     for (const auto & p : paths) {
         const DWORD flags = direct_
@@ -136,6 +253,16 @@ bool io_engine::init(const std::vector<std::string> & paths, unsigned queue_dept
             return false;
         }
         fds_.push_back((int) (intptr_t) h);   // HANDLEs ride the same vector; closed in shutdown()
+    }
+
+    // After the handles exist and before the workers do: the note is wanted even
+    // when the enable is refused, so the caller can print why rather than
+    // silently reading the traditional path.
+    if (bypass_req_) {
+        std::string note;
+        enable_bypass_io(fds_, note);
+        bypass_on_ = note.rfind("enabled on", 0) == 0;
+        bypass_note_ = bypass_on_ ? note : ("unavailable -- " + note);
     }
 
     // 512-byte layout on a 4096-sector filesystem: read a page-aligned window
@@ -284,7 +411,14 @@ void io_engine::worker_loop() {
 #else // !_WIN32 ---------------------------------------------------------------
 
 bool io_engine::init(const std::vector<std::string> & paths, unsigned queue_depth,
-                     bool direct_io, std::string & err, backend be) {
+                     bool direct_io, std::string & err, backend be, bool bypass_io) {
+    // BypassIO is a Windows mechanism (FSCTL_MANAGE_BYPASS_IO, Win11 + NTFS +
+    // NVMe, noncached reads). Linux already has O_DIRECT, which is the same
+    // thing done in the driver, so there is nothing to ask for here.
+    (void) bypass_io;
+    bypass_req_ = false;
+    bypass_on_  = false;
+    bypass_note_ = bypass_io ? "not a Windows platform" : "";
     shutdown();
     direct_ = direct_io;
     be_     = be;

@@ -87,24 +87,86 @@ public:
     //
     // Windows runs the threads backend only, over unbuffered overlapped reads
     // (FILE_FLAG_NO_BUFFERING): sector-aligned slice reads that bypass the
-    // cache manager, the documented Windows equivalent of O_DIRECT. Windows'
-    // own IoRing (io_uring's SQ/CQ design, Win11 21H2+) was considered and
-    // deliberately not used: it is Win11-only, its versioned op set is still
-    // maturing, and its win is syscall batching at thousands of in-flight
-    // ops -- not the engine's ~8-deep expert bursts, where per-read syscall
-    // count is 1 in both designs. Measured on this project's target NVMe
-    // (random 640 KiB-1 MiB slices, QD 4-64): thread pool + unbuffered reads
-    // 3.4-4.8 GB/s vs IoRing 1.3-1.9 GB/s -- the port is 2.5-3.6x faster.
-    // The submit/reap shape below is IoRing-like, so a future backend can
-    // slot in without touching this interface.
+    // cache manager, the documented Windows equivalent of O_DIRECT.
+    //
+    // Windows' own IoRing (io_uring's SQ/CQ design, Win11 21H2+) was considered.
+    //
+    // This comment used to say "measured: thread pool 3.4-4.8 GB/s vs IoRing
+    // 1.3-1.9 GB/s -- the port is 2.5-3.6x faster". THAT NUMBER WAS WRONG and is
+    // retracted. No IoRing implementation was ever committed, so it had no
+    // reproducible source, and when one was written (tools/qwfn_ioring.h,
+    // driven by tools/qwfn_iobpio.cpp) it did not reproduce.
+    //
+    // MEASURED 2026-09-30, HP FX900 Pro 2TB, 16 GB file, random 640 KiB-1 MiB
+    // slices, QD 1-64, modes interleaved, every mode byte-exact:
+    //
+    //   ioring/direct+wait   1.62 GB/s at QD 8 (+1.2%), 1.60 at QD 32 (-0.5%)
+    //                        thread pool 1.60 / 1.61 on the same pattern
+    //   service latency, QD 1, 2000 samples: ring p50 539 us, mean 541;
+    //                                    pool p50 557 us, mean 559
+    //
+    // So a ring is not slower than this pool -- it is the same to within about
+    // a percent, and marginally lower latency. There is no speed argument either
+    // way. What there is instead is a shape argument, and it is the one that
+    // decided it:
+    //
+    // The engine prefetches the next layer's experts *while the current layer
+    // computes*, then reaps whatever has finished (reap(min_complete)). A
+    // non-blocking SubmitIoRing does not give the kernel a reason to drain the
+    // submission queue, and with nothing blocking, BuildIoRingReadFile eventually
+    // fails with IORING_E_SUBMISSION_QUEUE_FULL -- measured, not reasoned:
+    // every opportunistic-reap variant failed that way, on unbuffered and
+    // buffered handles alike, while the blocking variant
+    // (SubmitIoRing(n, INFINITE), i.e. waiting for N completions, which Windows
+    // does support after all) was correct and fast. A ring port would have to
+    // block, or poll, and blocking would give back the overlap the prefetch
+    // exists to get.
+    //
+    // Preregistered buffers changed nothing measurable (11.96 vs 12.52 GB/s,
+    // noise) and would be awkward here anyway: the RAM tier is one large arena
+    // read through per-slot views, not standalone buffers.
+    //
+    // The submit/reap shape below is IoRing-like, so a future backend can slot
+    // in without touching this interface.
     enum class backend { uring, threads };
 
     // queue_depth is the io_uring ring size / the worker count.
+    //
+    // bypass_io is Windows-only and opt-in; on Linux it is ignored. It asks for
+    // FSCTL_MANAGE_BYPASS_IO on every handle, which is the platform's one
+    // mechanism that takes work *out* of the read path (a noncached read skips
+    // the filesystem, volume and storage filter stacks) rather than batching
+    // the submission of it. It only exists on Windows 11 + NTFS + NVMe, only
+    // for noncached reads, and is per file-open: any other handle on the same
+    // file opened for cached or memory-mapped I/O suspends it until that handle
+    // closes -- which this engine does, for the PLE table, on the same shards.
+    //
+    // MEASURED 2026-09-30 with tools/qwfn_iobpio.cpp, two NVMe volumes
+    // (HP FX900 Pro 2TB, Intel SSDPEKNU512GZ), 16 GB and 12 GB files, 640 KiB
+    // - 1 MiB random slices, QD 1-64, modes interleaved over 4 rounds, every
+    // mode byte-exact: the kernel accepted it on every handle ("enabled on 1
+    // handle(s)") and throughput moved by -0.2% to -1.1% (C:) and -0.9% to
+    // -2.9% (D:) -- noise, never positive. Holding a read-only mapping of the
+    // same file open, as the engine does for the PLE table, moved it by -0.3%
+    // to +0.5%, which is what suspension predicts: it puts the read back on the
+    // path it already had.
+    //
+    // The reason is visible in the same table and is the point: direct reads
+    // plateau at 1.6 GB/s (C:) and 1.17 GB/s (D:) by QD 8 and do not move at
+    // QD 16, 32 or 64. The device is the limit from QD 8, so there is no
+    // per-operation overhead left to remove -- which is also why IoRing could
+    // not have won here. Kept because it is cheap, and because the evidence for
+    // not bothering is worth more than the flag.
     bool init(const std::vector<std::string> & paths, unsigned queue_depth,
-              bool direct_io, std::string & err, backend be = backend::uring);
+              bool direct_io, std::string & err, backend be = backend::uring,
+              bool bypass_io = false);
 
     backend which() const { return be_; }
     void shutdown();
+
+    bool              bypass_requested() const { return bypass_req_; }
+    bool              bypass_active()   const { return bypass_on_; }
+    const std::string & bypass_note()    const { return bypass_note_; }
 
     // Queue reads. Returns the number accepted (short only if the ring is full).
     // Data for request i lands at dst + dio_pad(offset) when direct I/O is on,
@@ -143,6 +205,9 @@ private:
     std::vector<int> fds_;
     bool             direct_ = true;
     bool             bounce_ = false;   // direct reads through a page-aligned per-worker buffer (512-byte slot layout)
+    bool             bypass_req_ = false;   // bypass_io was asked for
+    bool             bypass_on_  = false;   // the kernel accepted it on every handle
+    std::string      bypass_note_;           // what the kernel said, or why it is unavailable
     size_t           in_flight_ = 0;
     unsigned         qd_ = 0;
     uint32_t         expect_[1024] = {};
